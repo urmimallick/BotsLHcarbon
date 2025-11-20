@@ -1,0 +1,1189 @@
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+#1. Setup and data load
+
+**Data descriptions**
+
+This dataset consists of two main components:
+
+A. Field and soil data: Collected from the field of view of camera trap sites in Central Boteti West (CT8), Botswana. This includes site information (IDs, lat/long, vegetation cover estimates, distances to features) and soil information (sample ID, moisture content, total/organic/inorganic carbon results, bulk density, and carbon stocks).
+
+| Column ID                | Description                                                                    |
+|------------------|------------------------------------------------------|
+| **sample**               | soil sample ID                                                                 |
+| **index \#**             | Sequential soil sample ID number                                               |
+| **area**                 | Study area: CT8 (Central Boteti West)                                          |
+| **site**                 | Camera site ID                                                                 |
+| **ID**                   | Alternative site IDs                                                           |
+| **longx**                | Longitude (X coordinate)                                                       |
+| **laty**                 | Latitude (Y coordinate)                                                         |
+| **soilm/m#**             | Soil moisture (%) measurements                                                 |
+| **tree/shrub/bare/herb** | Estimated percentage of ground cover for an expanded 5x5m sampling site        |
+| **soiltype**             | soil series classification (determined from CITE)                              |
+| **dist_river**           | Distance to the nearest source of ater (the Boteti River)                      |
+| **dist_cp**              | Distance to the nearest cattle-post                                            |
+| **dist_pa**              | Distance to the nearest protected area                                         |
+| **dist_village**         | Distance to the nearest village                                                |
+
+B. Camera Trap Data: Contains data from camera traps deployed at sites within the study area. This includes camera trap IDs, trapdays, and LH detections (wildlife, livestock, and functional traits).
+
+| Column ID    | Description                 |
+|--------------|-----------------------------|
+| **sample**   | sample ID                   |
+| **index \#** | Sequential sample ID number |
+|              |                             |
+
+```{r Libraries and font, echo=TRUE, tidy=TRUE, message=F, warning=FALSE}
+options(scipen = 999)  # Higher value reduces scientific notation
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/urmil/Dropbox (YSE)/MESc/Mallick et al 2024 NatEcolEvol/DATA/dataforanalysis/")
+
+library(mgcv)
+library(broom)
+library(knitr)
+library(plyr)
+library(tidyverse)
+library(reshape2)
+library(data.table)
+library(rgl)
+library(showtext)
+library(ggnewscale)
+library(gridExtra)
+library(car)
+library(sjPlot)
+library(ggpubr)
+library(stargazer)
+library(ggdist)
+library(viridis)
+library(lme4)
+library("report") 
+library(multcomp)
+library(ggforce)
+library(lmerTest)
+library(plotly)
+library(GGally)
+library('corrr')
+library(ggcorrplot)
+library("FactoMineR")
+library("devtools")
+library("factoextra")
+library(pls)
+library(ggfortify)
+library(bipartite)
+library(lmtest)
+library(ape)
+library(writexl)
+library(gratia)
+library(mgcViz)
+library(FD)
+library(vegan)
+library(picante)
+library(flextable)
+library(scales)
+
+font_add_google(name = "EB Garamond")
+showtext.auto()
+showtext_opts(dpi = 300)
+```
+
+```{r Load all soil/env + camera data, eval=TRUE, echo=TRUE, tidy=TRUE, warning=F}
+setwd("your directory")
+soilenv <- read.csv("sample.csv", header = T, fileEncoding = 'UTF-8-BOM')
+
+cams1 <- read.csv("FINAL22_CT8N.csv", header = T, sep = ",")
+cams2 <- read.csv("FINAL22_CT8S.csv", header = T, sep = ",")
+
+site_info <- read.csv("site_info.csv", header = T, fileEncoding = 'UTF-8-BOM', row.names = "ID")
+spp <- read.csv("spptraits.csv", header = TRUE, fileEncoding = 'UTF-8-BOM')
+rownames(spp) <- spp$spp
+herbitr <- read.csv("herbitraits.csv", header = T, fileEncoding = 'UTF-8-BOM', row.names = "Binomial")
+```
+
+#2. Camera trap data
+
+```{r Fix image IDs, message = F, warning = FALSE}
+cam <- rbind(cams1, cams2)
+spp$mass <- herbitr[as.character(spp$name), "Mass.g"]
+#Fix camera data species IDs with incorrect names/spelling from AI software
+cam <- cam |>
+  mutate(across(c(label1, label2), tolower)) |>
+  filter(label1 != "none") 
+
+cam$label1 <- gsub("cow_true", "cow", gsub("human on donkey", "donkey",
+   gsub("human on horse", "horse", gsub("human on foot", "human", cam$label1))))
+cam$label2 <- gsub("cow_true", "cow", gsub("human on donkey", "donkey",
+   gsub("human on horse", "horse", gsub("human on foot", "human", cam$label2))))
+```
+
+```{r Compile LH species detections & assign traits, message = F, warning = FALSE}
+cam <- cam |>
+  mutate(tag1 = ifelse(tag1 == "None", NA, tag1),
+         tag2 = ifelse(tag2 == "None", NA, tag2),
+         tag3 = ifelse(tag3 == "None", NA, tag3),
+
+    tags = paste0(tag1, tag2, tag3),
+    tags = str_remove_all(tags, "NA"),
+
+    activity = case_when(
+      str_detect(tags, "grazing|browsing") ~ "foraging",
+      str_detect(tags, "^trampling$") ~ "trampling",      
+      str_detect(tags, "trampling") ~ "trampling",       
+      str_detect(tags, "resting") ~ "trampling",          
+      TRUE ~ NA_character_  
+    )
+  )
+
+#Separate label 1 and 2 data and bind together as individual sightings
+spp1 <- cam |> 
+  dplyr::select(site, timestamp, label1, sightings1, activity) |>
+  dplyr::rename(spp = label1, total = sightings1)
+spp2 <- cam |> 
+  dplyr::select(site, timestamp, label2, sightings2, activity) |>
+  dplyr::rename(spp = label2, total = sightings2) |>
+  filter(spp != "none")
+
+sitedata <- rbind(spp1, spp2) |>
+  mutate(season = ifelse(str_starts(timestamp, "1/") | 
+                         str_starts(timestamp, "2/") | 
+                         str_starts(timestamp, "3/") | 
+                         str_starts(timestamp, "4/")
+                           , 
+                         "wet", "dry")) |>
+  filter(spp != "human") |>
+  dplyr::group_by(site, spp, activity, season) |>
+  dplyr::summarise(count = sum(total)) |>
+  tidyr::pivot_wider(names_from = activity, values_from = count) |>
+  replace_na(list(trampling = 0, foraging = 0)) |>
+  mutate(trampling = trampling + foraging) |>
+  select(-"NA") |>
+  tidyr::pivot_longer(cols = c(trampling, foraging), names_to = "activity", values_to = "count")
+
+sitedata$name <- spp[as.character(sitedata$spp), "name"]
+sitedata$class <- spp[as.character(sitedata$spp), "class"]
+sitedata$guild <- spp[as.character(sitedata$spp), "guild"]
+sitedata$size <- spp[as.character(sitedata$spp), "size"]
+sitedata$dig <- spp[as.character(sitedata$spp), "dig"]
+sitedata$mass <- spp[as.character(sitedata$spp), "mass"]
+sitedata$mbmass <- sitedata$mass^0.77
+sitedata$trapdays <- site_info[as.character(sitedata$site), "trapdays"]
+sitedata$site <- site_info[as.character(sitedata$site), "site"]
+sitedata <- sitedata |>
+  filter(!site %in% c("NA1", "NA7", "ND2", "ND3", "SB8"),
+         !spp %in% c("zebra", "hippo", "bushbuck", "buffalo"))
+```
+
+```{r LH spp counts & RAIs by sites, message = F, warning = F}
+sitelh <- sitedata |> 
+  filter(spp != "vehicle") |> 
+  mutate(zone = case_when(
+    str_detect(site, "N") ~ "CT8N",
+    str_detect(site, "S") ~ "CT8S",
+    TRUE ~ NA_character_))
+# TABLE S1
+sppactdata <- sitelh |>
+  group_by(spp, name, class, guild, size, dig, activity) |>
+  summarise(
+    count = sum(count, na.rm = TRUE),
+    biomassRAI = sum(count / trapdays * case_when(
+        activity == "trampling" ~ mass,
+        activity == "foraging" ~ mbmass)
+    ), .groups = "drop") |>
+  arrange(class)
+
+# Presence RAI (trampling total), to be used for bipartite graphs
+spppresdata <- sitelh |>
+  group_by(spp, name, class, guild, size, dig, activity) |>
+  filter(activity == "trampling") |>
+  summarise(count = sum(count), totalRAI = sum(count/trapdays)) |>
+  arrange(class)
+#Sum of all LH detections
+sum(spppresdata$count)
+#Percentage of detections that included foraging
+sum(sppactdata$count[sppactdata$activity == "foraging"])/sum(spppresdata$count)
+#Percentage of detections with grazing versus browsing
+camx <- cam |>
+  filter(!site %in% c("Y0051", "Y0008", "Y0020", "Y0023", "Y8900"),
+         !label1 %in% c("zebra", "hippo", "bushbuck", "buffalo"),
+         !label2 %in% c("zebra", "hippo", "bushbuck", "buffalo")
+  )
+total_grazing <- camx |>
+  filter(str_detect(tags, "grazing")) |>
+  summarise(total = sum(sightings1 + sightings2)) |>
+  pull(total)
+total_browsing <- camx |>
+  filter(str_detect(tags, "browsing")) |>
+  summarise(total = sum(sightings1 + sightings2)) |>
+  pull(total)
+total_grazing/sum(spppresdata$count)
+total_browsing/sum(spppresdata$count)
+
+#LH biomass, species diversity, and functional group presence/activity RAIs
+LHmetrics <- sitelh |>
+  group_by(site) |>
+  summarise(
+    LHmass = sum(count / trapdays * mass),
+    LHmbmass = sum(count / trapdays * mbmass),
+    sppdiv = length(unique(spp)),
+    .groups = "drop"
+)
+# CLASS ------------------------------------------------
+#First just total group-specific RAIs
+class <- sitelh |>
+  group_by(site, class) |>
+  filter(activity == "trampling") |>
+  summarise(RAI = sum(count / trapdays), .groups = "drop") |>
+  spread(class, RAI, fill = 0)
+#Then class activities by season, weighted by mass or mbmass
+classact <- sitelh |>
+  group_by(site, class, activity, season) |>
+  summarise(
+    biomass = sum(
+      count / trapdays * case_when(
+        activity == "trampling" ~ mass,
+        activity == "foraging" ~ mbmass)
+    ), .groups = "drop") |>
+  mutate(activity = paste(class, activity, season, sep = "_")) |>
+  select(-class, -season) |>
+  spread(activity, biomass, fill = 0)
+# GUILD ------------------------------------------------
+guild <- sitelh |>
+  group_by(site, guild) |>
+  filter(activity == "trampling") |>
+  summarise(RAI = sum(count / trapdays), .groups = "drop") |>
+  spread(guild, RAI, fill = 0)
+guildact <- sitelh |>
+  group_by(site, guild, activity, season) |>
+  summarise(
+    biomass = sum(
+      count / trapdays * case_when(
+        activity == "trampling" ~ mass,
+        activity == "foraging" ~ mbmass)
+    ), .groups = "drop") |>
+  mutate(activity = paste(guild, activity, season, sep = "_")) |>
+  select(-guild, -season) |>
+  spread(activity, biomass, fill = 0)
+# SIZE ------------------------------------------------
+size <- sitelh |>
+  group_by(site, size) |>
+  filter(activity == "trampling") |>
+  summarise(RAI = sum(count / trapdays), .groups = "drop") |>
+  spread(size, RAI, fill = 0)
+sizeact <- sitelh |>
+  group_by(site, size, activity, season) |>
+  summarise(
+    biomass = sum(
+      count / trapdays * case_when(
+        activity == "trampling" ~ mass,
+        activity == "foraging" ~ mbmass)
+    ), .groups = "drop") |>
+  mutate(activity = paste(size, activity, season, sep = "_")) |>
+  select(-size, -season) |>
+  spread(activity, biomass, fill = 0)
+# DIG -------------------------------------------------
+dig <- sitelh |>
+  group_by(site, dig) |>
+  filter(activity == "trampling") |>
+  summarise(RAI = sum(count / trapdays), .groups = "drop") |>
+  spread(dig, RAI, fill = 0)  
+digact <- sitelh |>
+  group_by(site, dig, activity, season) |>
+  summarise(
+    biomass = sum(
+      count / trapdays * case_when(
+        activity == "trampling" ~ mass,
+        activity == "foraging" ~ mbmass)
+    ), .groups = "drop") |>
+  mutate(activity = paste(dig, activity, season, sep = "_")) |>
+  select(-dig, -season) |> 
+  spread(activity, biomass, fill = 0)
+# ACTIVITY ----------------------------------------------
+act <- sitelh |>
+  group_by(site, activity) |>
+  summarise(RAI = sum(count / trapdays), .groups = "drop") |>
+  spread(activity, RAI, fill = 0)
+activity <- sitelh |>
+  group_by(site, activity, season) |>
+  summarise(
+    biomass = sum(
+      count / trapdays * case_when(
+        activity == "trampling" ~ mass,
+        activity == "foraging" ~ mbmass)
+    ), .groups = "drop") |>
+  mutate(activity = paste(activity, season, sep = "_")) |>
+  select(-season) |> 
+  spread(activity, biomass, fill = 0)
+```
+
+```{r Join LH data by site, message = F, warning = FALSE}
+camdata_list <- list(LHmetrics, act, activity, class, classact, guild, guildact, size, sizeact, dig, digact)
+
+camdata <- camdata_list[[1]]
+
+for (i in 2:length(camdata_list)) {
+  camdata <- merge(camdata, camdata_list[[i]], by = "site", all = TRUE)
+}
+camdata[is.na(camdata)] <- 0
+row.names(site_info) <- site_info$site
+camdata$mvmt <- site_info[as.character(camdata$site), "mvmt"]
+```
+
+```{r FIGURE 2: LH bipartite graphs, message=F, warning=F}
+# FIGURE 2 PART 1: Wildlife feeding guild
+wguilds <- spppresdata |>
+  filter(class == "wildlife") |>
+  pivot_wider(names_from = guild, values_from = totalRAI, values_fill = 0) |>
+  column_to_rownames(var = "spp") |>
+  dplyr::select(-class, -size, -dig, -count, -name, -activity)
+wguilds <- as.data.frame(t(wguilds))  
+wguilds[] <- lapply(wguilds, function(x) as.numeric(as.character(x)))
+w_order <- c("elephant", "giraffe", "warthog", "impala", "ostrich", "wildebeest", "kudu", "gemsbok", "springbok", "steenbok", "duiker") 
+
+wguilds <- wguilds[, w_order]
+guilds <- c( "brown4", "darkgreen", "lightgreen")
+magma <- magma(20)
+magma1 <- rev(magma[-c(1:5, 17:20)])
+plotweb(wguilds, empty = FALSE, text.rot = 90, 
+        col.interaction = magma1, col.high = magma1, 
+        bor.col.interaction = "transparent", col.low = guilds)
+# FIGURE 2 PART 2: Wildlife digestive types
+wdig <- spppresdata |>
+  filter(class == "wildlife") |>
+  pivot_wider(names_from = dig, values_from = totalRAI, values_fill = 0)
+wdig <- wdig |>
+    column_to_rownames(var = "spp") |>
+    dplyr::select(-class, -size, -guild, -count, -name, -activity)
+
+wdig <- as.data.frame(t(wdig))
+wdig[] <- lapply(wdig, function(x) as.numeric(as.character(x)))
+wdig <- wdig[, w_order]
+
+digestive <- c("coral3", "cyan4")
+plotweb(wdig, empty = FALSE, text.rot = 90, 
+        col.interaction = magma1, col.high = magma1, 
+        bor.col.interaction = "transparent", col.low = digestive)
+
+# FIGURE 2 PART 3: Livestock feeding guild
+lguilds <-  spppresdata |>
+  filter(class == "livestock") |>
+  pivot_wider(names_from = guild, values_from = totalRAI, values_fill = 0) |>
+  column_to_rownames(var = "spp") |>
+    dplyr::select(-class, -size, -dig, -count, -name, -activity)
+
+lguilds <- as.data.frame(t(lguilds))  
+lguilds[] <- lapply(lguilds, function(x) as.numeric(as.character(x)))
+l_order <- c("goat", "horse", "cow", "sheep", "donkey") 
+
+lguilds <- lguilds[, l_order]
+guilds <- c("lightgreen", "brown4", "darkgreen")
+magma2 <- magma[c(4, 7, 10, 13, 16)]
+plotweb(lguilds, empty = FALSE, text.rot = 90, 
+        col.interaction = magma2, col.high = magma2, 
+        bor.col.interaction = "transparent", col.low = guilds)
+# FIGURE 2 PART 4: Livestock digestive types
+ldig <- spppresdata |>
+  filter(class == "livestock") |>
+  pivot_wider(names_from = dig, values_from = totalRAI, values_fill = 0)
+ldig <- ldig |>
+    column_to_rownames(var = "spp") |>
+    dplyr::select(-class, -size, -guild, -count, -name, -activity)
+
+ldig <- as.data.frame(t(ldig))
+ldig[] <- lapply(ldig, function(x) as.numeric(as.character(x)))
+ldig <- ldig[, l_order]
+
+digestive <- c("coral3", "cyan4")
+plotweb(ldig, empty = FALSE, text.rot = 90, 
+        col.interaction = magma2, col.high = magma2, 
+        bor.col.interaction = "transparent", col.low = digestive)
+```
+
+#3. Soil C & environmental data
+
+```{r GC/BD/Sand/C stocks/NDVI, message=F, warning=F}
+# GROUND COVER & MERGE ALL ----------------------------------
+envcam <- merge(soilenv, camdata, by = "site") |> 
+  mutate(pcov = (herb + tree + shrub)/(herb + tree + shrub + bare),
+        pcan = (tree + shrub)/(herb + tree + shrub + bare),
+         pbare = bare/(herb + tree + shrub + bare)) |>
+  dplyr::select(-tree, -shrub, -herb, -bare)
+# BD relationships ----------------------------------------------------
+BD_no <- envcam[is.na(envcam$BD), ]
+BD_yes <- envcam[!is.na(envcam$BD), ]
+# BD MODEL  ---------------------------------------------------------
+bd <- lmer(BD ~ soilm + type + zone:ndvi_wet2022 + (1 | zone), data = envcam)
+AIC(bd)
+BIC(bd)
+summary(bd)
+tab_model(bd)
+# BD MODEL CHECK ----------------------------------------------------
+qqnorm(resid(bd))
+qqline(resid(bd), col = "red")
+plot(resid(bd) ~ fitted(bd),
+     xlab = "Fitted values",
+     ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+#Predict BD for no-BD sites ------------------------------------------
+BD_no$BD <- predict(bd, newdata = BD_no)
+
+# SAND relationships -------------------------------------------------
+sand_no <- envcam[is.na(envcam$sand), ]
+sand_yes <- envcam[!is.na(envcam$sand), ]
+
+sandv <- envcam |> 
+  dplyr::select(sand, pcov:pbare, soilm, laty, longx) |>
+  drop_na()
+sandv <- as.data.frame(cor(scale(sandv)))
+# SAND MODEL  ---------------------------------------------------------
+sand <- lmer(sand ~ soilm + laty + soiltype + (1 | zone), data = envcam)
+AIC(sand)
+BIC(sand)
+summary(sand)
+tab_model(sand)
+# SAND MODEL CHECKS ---------------------------------------------------
+qqnorm(resid(sand))
+qqline(resid(sand), col = "red")
+plot(resid(sand) ~ fitted(sand),
+     xlab = "Fitted values",
+     ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+#Predict SAND for no-SAND sites ------------------------------------------
+sand_no$sand <- predict(sand, newdata = sand_no)
+allsand <- rbind(sand_yes, sand_no) 
+rownames(allsand) <- allsand$index
+#Combine all data again & Calculate C stocks
+soilcam <- rbind(BD_yes, BD_no) |>
+  arrange(index) |>
+  mutate(SOCstock = TOC * BD * 0.1 * 15,
+         TCstock = TC * BD * 0.1 * 15,
+         TICstock = TCstock - SOCstock)
+soilcam$sand <- allsand[as.character(soilcam$index), "sand"]
+# Reorder final soilcam dataset---------------------------------------
+new_order <- c(1:13, 86:92, 14:85)
+soilcamfd <- soilcam[, new_order] |>
+  dplyr::filter(type == "Fd") |>
+  mutate(avgndvi = rowMeans(across(c(ndvi_dry2022, ndvi_wet2022))))
+```
+
+```{r Figure S3, S4, warning=F, message=F}
+# Environmental covariates ~ soil C ---------------------------------------
+colors <- c("#934607", "darkolivegreen", "#C89F76")
+(metricsC <- soilcamfd |>
+    select(site, zone, area, sand, pbare, 
+         dist_river, TCstock, SOCstock, TICstock) |>
+    pivot_longer(cols = c(sand:dist_river), names_to = "var", values_to = "Value") |>
+   pivot_longer(cols = c(TCstock:TICstock), names_to = "soilc", values_to = "soilval"))
+
+r2_labels <- metricsC %>%
+  group_by(var, soilc) %>%
+  group_map(~ {
+    model <- lm(soilval ~ Value, data = .x)
+    glance(model) %>%
+      mutate(var = .y$var, soilc = .y$soilc)
+  }, .keep = TRUE) %>%
+  bind_rows() %>%
+  mutate(
+    r2_label = paste0(soilc, ": R² = ", round(r.squared, 2)),
+    y_pos = case_when(
+      soilc == "TCstock" ~ 6,
+      soilc == "SOCstock" ~ 5.7,
+      soilc == "TICstock" ~ 5.4))
+
+(envsoilc <- ggplot(metricsC, aes(x = Value, y = soilval, col = soilc)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth( se = T, fullrange = F) +
+  facet_wrap(~ var, scales = "free_x", nrow = 1) +
+  labs(x = "Covariate", y = "Soil C stock") +
+  theme_bw() +
+  geom_text(
+    data = r2_labels,
+    aes(x = -Inf, y = y_pos, label = r2_label, color = soilc),
+    hjust = -0.1, vjust = 0,
+    inherit.aes = FALSE
+  ) +
+    ylim(0, 6.1) +
+  scale_color_manual(values=colors, name="Soil C stocks") +
+     #labels=c("CT8-North", "CT8-South", "soilcols")) +
+  theme(text = element_text(family = "EB Garamond", size = 8),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank()
+))
+```
+
+#4. Relationships
+
+```{r FIGURE 3: LH/soil/NDVI, message=F, warning=F}
+colors <- c("#934607", "darkolivegreen", "#C89F76", "#9CAF88")
+color <- c("#D97642", "#934607")
+#act_colors <- setNames(colors, terms)
+
+sc <- soilcamfd |>
+  dplyr::select(site, zone, TICstock, SOCstock, trampling_dry, trampling_wet, foraging_dry, foraging_wet) |>
+  pivot_longer(cols = c(TICstock:foraging_wet), names_to = "lhvar", values_to = "Value")
+
+act_season <- sc |>
+  filter(!lhvar %in% c("TICstock", "SOCstock")) |>
+  mutate(
+    activity_type = str_extract(lhvar, "foraging|trampling"),
+    activity_type = factor(activity_type, levels = c("trampling", "foraging")),
+    season = str_extract(lhvar, "dry|wet"),
+    season = factor(season, levels = c("dry", "wet")),
+    lhvar = factor(lhvar, levels = c("trampling_wet", "foraging_wet", "trampling_dry", "foraging_dry"))) |>
+  arrange(site) |>
+  mutate(site_lhvar = factor(interaction(site, lhvar), 
+          levels = unique(interaction(site, lhvar)))) |>
+  left_join(soilcamfd |> dplyr::select(site, ndvi_wet2022, ndvi_dry2022, avgndvi), by = "site")
+# LH trampling/foraging activity with NDVI in background ------------------------
+act_season <- act_season %>%
+  mutate(site = factor(site, levels = unique(site)))
+activity_data <- act_season %>%
+  group_by(site, activity_type) %>%
+  summarise(Value = sum(Value, na.rm = TRUE), .groups = "drop")
+ndvi_data <- act_season %>%
+  distinct(site, ndvi_wet2022, ndvi_dry2022, avgndvi)
+ndvi_scale <- 2e8
+
+ndvi_data <- ndvi_data |>
+  mutate(site = fct_reorder(site, avgndvi)) |>
+  pivot_longer(
+    cols = c(ndvi_wet2022, ndvi_dry2022),
+    values_to = "ndvi"
+  )
+ndvi_scale <- 20 / 0.3
+
+activity_data <- activity_data %>%
+  mutate(site = factor(site, levels = levels(ndvi_data$site)),
+    logactivity = log10(Value + 1))
+
+(lhndvi <- ggplot() +
+  geom_bar(data = ndvi_data, 
+           aes(x = site, y = ndvi * ndvi_scale, group = name, alpha = 0.7),
+           stat = "identity", position = position_dodge(width = 1), width = 1,
+           fill = "darkolivegreen4") +
+  geom_bar(data = activity_data, 
+           aes(x = site, y = logactivity, fill = activity_type),
+           stat = "identity", position = position_dodge(width = 1), width = 1) +
+  labs(x = "Site", y = "Biomass-weighted LH activity", fill = "Activity Type") +
+  coord_cartesian(ylim = c(0, 20)) +
+  scale_fill_manual(values = color) +
+  scale_y_continuous(
+    name = "Biomass-weighted LH activity",
+    sec.axis = sec_axis(~ . / ndvi_scale, name = "NDVI (background)")
+  ) +
+  theme_bw() +
+  theme(
+    text = element_text(family = "EB Garamond", size = 14),
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank()
+  ))
+# Carbon stacked plot ---------------------------------------------------------
+colors <- c("burlywood3", "darkgoldenrod4")
+
+cplot <- sc %>%
+  filter(lhvar %in% c("TICstock", "SOCstock")) |>
+  mutate(
+    type = factor(lhvar, levels = c("TICstock", "SOCstock")),
+    site = factor(site, levels = levels(ndvi_data$site)),
+    site_lhvar = factor(interaction(site, lhvar),
+                        levels = unique(interaction(site, lhvar)))
+)
+(cplot <-  cplot |>
+  ggplot(aes(x = site, y = Value, fill = type)) +
+  geom_bar(stat = "identity", width = 1, position = "stack") +
+  labs(x = "Site", y = "Soil carbon stocks") +
+  scale_fill_manual(values=colors, name="Soil C stocks", 
+      labels=c("SOCstock", "SICstock")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  theme_bw() +
+  scale_fill_manual(values=colors) +
+  theme(text = element_text(family = "EB Garamond", size = 14), 
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank()))
+```
+
+```{r Data additiona - prep for models, message=F, warning=F}
+soilcamfd <- soilcamfd |>
+  mutate(
+         trlh = trampling_dry + trampling_wet,
+         forlh = foraging_dry + foraging_wet,
+         lhtotal = trlh + forlh,
+         ltr = livestock_trampling_dry + livestock_trampling_wet,
+         wtr = wildlife_trampling_dry + wildlife_trampling_wet,
+         lfr = livestock_foraging_dry + livestock_foraging_wet,
+         wfr = wildlife_foraging_dry + wildlife_foraging_wet,
+         brfr = browser_foraging_dry + browser_foraging_wet,
+         brtr = browser_trampling_dry + browser_trampling_wet,
+         grfr = grazer_foraging_dry + grazer_foraging_wet,
+         grtr = grazer_trampling_dry + grazer_trampling_wet,
+         mffr = mixedfeeder_foraging_dry + mixedfeeder_foraging_wet,
+         mftr = mixedfeeder_trampling_dry + mixedfeeder_trampling_wet,
+         rumfr = ruminant_foraging_dry + ruminant_foraging_wet,
+         rumtr = ruminant_trampling_dry + ruminant_trampling_wet,
+         nrumfr = nonruminant_foraging_dry + nonruminant_foraging_wet,
+         nrumtr = nonruminant_trampling_dry + nonruminant_trampling_wet,
+         l = ltr + lfr + 1e-12,
+         w = wtr + wfr,
+         br = brfr + brtr,
+         gr = grfr + grtr,
+         mf = mffr + mftr,
+         rum = rumfr + rumtr,
+         nrum = nrumtr + nrumfr,
+)
+```
+
+```{r FIGURE S1: LH distance metrics, message=F, warning=F}
+lhlong <- soilcamfd |>
+  dplyr::select(site, zone, dist_river:dist_village, l:nrum) |>
+  pivot_longer(cols = c(l:nrum), names_to = "var", values_to = "Value") |>
+  pivot_longer(cols = c(dist_river:dist_village), names_to = "soilc", values_to = "soilval")
+
+(lhdist <- ggplot(lhlong, aes(x = log(Value), y = soilval, col = var)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth( se = T, fullrange = F) +
+  facet_wrap(~ soilc, scales = "free_y", nrow = 1) + 
+  labs(x = "log(LH metric)", y = "Distance covariate (m)") +
+  theme_bw() +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme(text = element_text(family = "EB Garamond", size = 8),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank()
+))
+```
+
+```{r Random stats & FIGURE S8, warning=F, message=F}
+c_ranges <- soilcamfd %>%
+  summarise(across(c(TCstock, SOCstock, TICstock), list(min = min, max = max), na.rm = TRUE))
+
+soilcamfd %>%
+  filter(trlh > 5e7) %>%
+  select(site, trlh)
+
+(plot <- soilcamfd %>%
+  ggplot(aes(x = LHmass, y = BD)) +
+  geom_point(color = "steelblue", size = 3, alpha = 0.6) +
+  geom_smooth(se = TRUE, color = "darkolivegreen") +
+  coord_cartesian(ylim = c(1, 2)) +  
+  theme_bw() +         
+  theme(
+    text = element_text(family = "EB Garamond", size = 6),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank()
+  ) +
+  labs(
+    x = "Biomass-Weighted Large Herbivore Activity RAI (kg/trap-days)",
+    y = "Soil Bulk Density (g/cm³)",
+  ))
+```
+
+```{r FIGURE 2C: Wild LH proportions across study area}
+(percents <- soilcamfd |>
+  mutate(livestock_perc = (livestock_foraging_dry + livestock_foraging_wet 
+                       + livestock_trampling_dry + livestock_trampling_wet)
+                   /(livestock_foraging_dry + livestock_foraging_wet 
+                       + livestock_trampling_dry + livestock_trampling_wet 
+                     + wildlife_foraging_dry + wildlife_foraging_wet 
+                         + wildlife_trampling_dry + wildlife_trampling_wet)) |>
+    dplyr::select(site, longx, laty, livestock_perc) |>
+  mutate(wperc = 1-livestock_perc))
+```
+
+```{r FIGURE S11: Covariance matrix for predictors considered}
+covmatrix <- as.data.frame(scale(soilcamfd[, c(
+    "avgndvi", "pbare", "sand", "laty", "longx", "dist_river", "dist_cp", "dist_village", "dist_pa")]))
+m <- melt(cov(covmatrix))
+ggplot(m, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", high = "darkolivegreen", mid = "white",
+                       midpoint = 0, limit = c(-1, 1)) +
+  theme_minimal() +
+  theme(
+    text = element_text(family = "EB Garamond", size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10)
+  ) +
+  labs(fill = "Covariance")
+```
+
+#5. FIGURE S6: GAM set 1 for TCstock
+
+```{r GAM 1.1: TCstock ~ LH activity, message=F, warning=F}
+tclh <- gam(TCstock ~ 
+              s(trlh, k=4) + s(forlh, k=4) 
+             + s(sand) + s(pbare) + s(dist_river)
+             , data = soilcamfd, method = "REML"
+             )
+summary(tclh)
+appraise(tclh)
+draw(tclh, residuals = T, parametric = T, scales="fixed")
+gam.check(tclh)
+
+tidy(tclh, conf.int = TRUE)
+tclh <- getViz(tclh)
+smooth_terms <- list(
+  "s(trlh)"          = "#934607",
+  "s(forlh)"         = "darkolivegreen",
+  "s(sand)"          = "steelblue",  
+  "s(pbare)"         = "steelblue", 
+  "s(dist_river)"    = "steelblue" 
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(tclh, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_ciPoly(fill = term_color, alpha = 0.4) +
+    l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 8))
+}))
+as_flextable(tclh) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(tclh)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r GAM 1.2: TCstock ~ Class, message=F, warning=F}
+tcclass <- gam(TCstock ~ 
+               + s(ltr, k=4) + s(lfr, k=4) 
+               + s(wtr, k=4) + s(wfr, k=4)
+            + s(sand) + s(pbare) + s(dist_river)
+             , data = soilcamfd, method = "REML"
+             )
+summary(tcclass)
+appraise(tcclass)
+gam.check(tcclass)
+draw(tcclass, residuals = T, parametric = T, scales="fixed")
+
+tcclass <- getViz(tcclass)
+smooth_terms <- list(
+  "s(ltr)"           = "#934607",
+  "s(lfr)"           = "darkolivegreen",
+  "s(wtr)"           = "#934607",
+  "s(wfr)"           = "darkolivegreen",
+  "s(dist_river)"    = "steelblue",  
+  "s(sand)"          = "steelblue",  
+  "s(pbare)"         = "steelblue" 
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+  plot(sm(tcclass, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_rug(alpha = 0.3) +
+    l_ciPoly(fill = term_color, alpha = 0.4) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 8))
+}))
+as_flextable(tcclass) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(tcclass)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r GAM 1.3: TCstock ~ Guild + Activity, message=F, warning=F}
+tcguild <- gam(TCstock ~ 
+              s(grtr, k=4) + s(grfr, k=4)
+            + s(brtr, k=4) + s(brfr, k=4)
+            + s(mftr, k=4) +  s(mffr, k=4)
+            + s(sand) + s(pbare) + s(dist_river)
+            , data = soilcamfd, method = "REML"
+            )
+summary(tcguild)
+appraise(tcguild)
+gam.check(tcguild)
+draw(tcguild, residuals = T, parametric = T, scales="fixed")
+
+tcguild <- getViz(tcguild)
+smooth_terms <- list(
+  "s(grtr)"   = "#934607",
+  "s(grfr)"   = "darkolivegreen",
+  "s(brtr)"   = "#934607",
+  "s(brfr)"   = "darkolivegreen",
+  "s(mftr)"   = "#934607",
+  "s(mffr)"   = "darkolivegreen",
+  "s(dist_river)"   = "steelblue",  
+  "s(sand)"         = "steelblue",  
+  "s(pbare)"        = "steelblue" 
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(tcguild, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_rug(alpha = 0.3) +
+    l_ciPoly(fill = term_color, alpha = 0.4) + l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 8))
+}))
+as_flextable(tcguild) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(tcguild)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r GAM 1.4: TCstock ~ Digestive + Activity, message=F, warning=F}
+tcdig <- gam(TCstock ~ 
+               s(rumtr, k=5) + s(rumfr, k=5) 
+             + s(nrumtr, k=5) + s(nrumfr, k=5)
+            + s(sand) + s(pbare) + s(dist_river)
+            , data = soilcamfd, method = "REML"
+            )
+summary(tcdig)
+appraise(tcdig)
+gam.check(tcdig)
+draw(tcdig, residuals = T, parametric = T, scales="fixed")
+
+tcdig <- getViz(tcdig)
+smooth_terms <- list(
+  "s(rumtr)"         = "#934607",
+  "s(rumfr)"         = "darkolivegreen",
+  "s(nrumtr)"        = "#934607",
+  "s(nrumfr)"        = "darkolivegreen",
+  "s(dist_river)"    = "steelblue",  
+  "s(sand)"          = "steelblue",  
+  "s(pbare)"         = "steelblue" 
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(tcdig, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_rug(alpha = 0.3) +
+    l_ciPoly(fill = term_color, alpha = 0.4) + l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 8))
+}))
+as_flextable(tcdig) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(tcdig)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+#6. FIGURE 4: GAM set 2 for SICstock 
+
+```{r GAM 2.1: SICstock ~ LH activity, message=F, warning=F}
+siclh <- gam(TICstock ~ 
+              s(trlh, k=4) + s(forlh, k=4) 
+            + s(sand) + s(pbare) + s(dist_river)
+            , family = tw(link="log")
+            , data = soilcamfd, method = "REML"
+            )
+summary(siclh)
+appraise(siclh)
+draw(siclh, residuals = T, parametric = T, scales="fixed")
+gam.check(siclh)
+
+tidy(siclh, conf.int = TRUE)
+siclh <- getViz(siclh)
+smooth_terms <- list(
+  "s(trlh)"          = "#934607",
+  "s(forlh)"         = "darkolivegreen",
+  "s(sand)"          = "steelblue",  
+  "s(pbare)"         = "steelblue", 
+  "s(dist_river)"    = "steelblue" 
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(siclh, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_ciPoly(fill = term_color, alpha = 0.4) +
+    l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 12))
+}))
+as_flextable(siclh) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(siclh)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r GAM 2.2: SICstock ~ Class, message=F, warning=F}
+sicclass <- gam(TICstock ~ 
+               s(ltr, k=4) + s(lfr, k=4)
+             + s(wtr, k=4) + s(wfr, k=4)
+             + s(sand) + s(pbare) + s(dist_river)
+             , family = tw(link="log")
+             , data = soilcamfd, method = "REML"
+             )
+summary(sicclass)
+appraise(sicclass)
+draw(sicclass, residuals = T, parametric = T, scales="fixed")
+gam.check(sicclass)
+
+sicclass <- getViz(sicclass)
+smooth_terms <- list(
+  "s(ltr)"           = "#934607",
+  "s(lfr)"           = "darkolivegreen",
+  "s(wtr)"           = "#934607",
+  "s(wfr)"           = "darkolivegreen",
+  "s(dist_river)"    = "steelblue",  
+  "s(sand)"          = "steelblue",  
+  "s(pbare)"         = "steelblue" 
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(sicclass, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_ciPoly(fill = term_color, alpha = 0.4) + l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 13))
+}))
+as_flextable(sicclass) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(sicclass)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r GAM 2.3: SICstock ~ Guild + Activity, message=F, warning=F}
+sicguild <- gam(TICstock ~ 
+               s(grtr, k=4) + s(grfr, k=4)
+             + s(brtr, k=4) + s(brfr, k=4)
+             + s(mftr, k=4) + s(mffr, k=4)
+             + s(sand) + s(pbare) + s(dist_river)
+             , family = tw(link="log")
+             , data = soilcamfd, method = "REML"
+             )
+summary(sicguild) 
+appraise(sicguild)
+draw(sicguild, residuals = T, parametric = T, scales="fixed")
+gam.check(sicguild)
+
+sicguild <- getViz(sicguild)
+smooth_terms <- list(
+  "s(grtr)"         = "#934607",
+  "s(grfr)"         = "darkolivegreen",
+  "s(brtr)"         = "#934607",
+  "s(brfr)"         = "darkolivegreen",
+  "s(mftr)"         = "#934607",
+  "s(mffr)"         = "darkolivegreen",
+  "s(dist_river)"   = "steelblue",  
+  "s(sand)"         = "steelblue",
+  "s(pbare)"        = "steelblue"
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(sicguild, i)) +
+    l_fitLine(colour = "black", size = 1.2) + l_rug(alpha = 0.3) +
+    l_ciPoly(fill = term_color, alpha = 0.4) + l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 13))
+}))
+as_flextable(sicguild) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(sicguild)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r GAM 2.4: SICstock ~ Digestive + Activity, message=F, warning=F}
+sicdig <- gam(TICstock ~ 
+              s(rumtr, k=5) + s(rumfr, k=5) 
+             + s(nrumtr, k=5) + s(nrumfr, k=5) 
+             + s(sand) + s(pbare) + s(dist_river)
+             , family = tw(link="log")
+             , data = soilcamfd, method = "REML"
+             )
+summary(sicdig) 
+appraise(sicdig)
+draw(sicdig, residuals = T, parametric = T, scales="fixed")
+gam.check(sicdig)
+
+sicdig <- getViz(sicdig)
+smooth_terms <- list(
+  "s(rumtr)"         = "#934607",
+  "s(rumfr)"         = "darkolivegreen",
+  "s(nrumtr)"        = "#934607",
+  "s(nrumfr)"        = "darkolivegreen",
+  "s(sand)"          = "steelblue",  
+  "s(pbare)"         = "steelblue",
+  "s(dist_river)"    = "steelblue"
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(sicdig, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_ciPoly(fill = term_color, alpha = 0.4) + l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 12))
+}))
+as_flextable(sicdig) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(sicdig)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r FIGURE S7: Concurvity matrix}
+#Concurvity checks for predictors in final models
+concurv <- round(concurvity(siclh, full=F)$observed, 2) 
+(heatmap <- ggcorr(data=NULL, cor_matrix=concurv[2:6,2:6], label=T, limits = c(0,1), midpoint = 0.5, 
+         name = "Concurvity", low = "floralwhite", mid = "floralwhite", high = "darkolivegreen", hjust=1, layout.exp = 0.9, label_alpha = T))
+
+concurv <- round(concurvity(siclass, full=F)$observed, 2) 
+(heatmap <- ggcorr(data=NULL, cor_matrix=concurv[2:8,2:8], label=T, limits = c(0,1), midpoint = 0.5, 
+         name = "Concurvity", low = "floralwhite", mid = "floralwhite", high = "darkolivegreen", hjust=1, layout.exp = 0.9,
+         label_alpha = T))
+
+concurv <- round(concurvity(sicguild, full=F)$observed, 2) 
+(heatmap <- ggcorr(data=NULL, cor_matrix=concurv[2:10,2:10], label=T, limits = c(0,1), midpoint = 0.5, 
+         name = "Concurvity", low = "floralwhite", mid = "floralwhite", high = "darkolivegreen", hjust=1, layout.exp = 0.9,
+         label_alpha = T))
+
+concurv <- round(concurvity(sicdig, full=F)$observed, 2) 
+(heatmap <- ggcorr(data=NULL, cor_matrix=concurv[2:8,2:8], label=T, limits = c(0,1), midpoint = 0.5, 
+         name = "Concurvity", low = "floralwhite", mid = "floralwhite", high = "darkolivegreen", hjust=1, layout.exp = 0.9,
+         label_alpha = T))
+```
+
+#7. FIGURE 5: GAM set 3 for SOCstock 
+
+```{r GAM 3.1: SOCstock ~ LH activity, message=F, warning=F}
+toclh <- gam(SOCstock ~ 
+               s(trlh, k=4) + s(forlh, k=4) 
+             + s(sand) + s(pbare) + s(dist_river)
+             , data = soilcamfd, method = "REML"
+             )
+summary(toclh) 
+appraise(toclh)
+draw(toclh, residuals = T, parametric = T, scales="fixed")
+gam.check(toclh)
+
+tidy(toclh, conf.int = TRUE)
+toclh <- getViz(toclh)
+smooth_terms <- list(
+  "s(trlh)"          = "#934607",
+  "s(forlh)"         = "darkolivegreen",
+  "s(sand)"          = "steelblue",  
+  "s(pbare)"         = "steelblue", 
+  "s(dist_river)"    = "steelblue" 
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(toclh, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_ciPoly(fill = term_color, alpha = 0.4) + l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 12))
+}))
+as_flextable(toclh) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(toclh)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r GAM 3.2: SOCstock ~ Class, message=F, warning=F}
+tocclass <- gam(SOCstock ~ 
+                 s(ltr) + s(lfr) 
+               + s(wtr) + s(wfr)
+               + s(sand) + s(pbare) + s(dist_river)
+             , data = soilcamfd, method = "REML"
+             )
+summary(tocclass)  
+appraise(tocclass)
+gam.check(tocclass)
+draw(tocclass, residuals = T, parametric = T, scales="fixed")
+
+tocclass <- getViz(tocclass)
+smooth_terms <- list(
+  "s(ltr)"           = "#934607",
+  "s(lfr)"           = "darkolivegreen",
+  "s(wtr)"           = "#934607",
+  "s(wfr)"           = "darkolivegreen",
+  "s(dist_river)"    = "steelblue",  
+  "s(sand)"          = "steelblue",  
+  "s(pbare)"         = "steelblue" 
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(tocclass, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_ciPoly(fill = term_color, alpha = 0.4) + l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 13))
+}))
+as_flextable(tocclass) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(tocclass)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r GAM 3.3: SOCstock ~ Guild + Activity, message=F, warning=F}
+tocguild <- gam(SOCstock ~ 
+               s(grtr, k=4) + s(grfr, k=4) 
+             + s(brtr, k=4) + s(brfr, k=4) 
+             + s(mftr, k=4) + s(mffr, k=4) 
+             + s(sand) + s(pbare) + s(dist_river)
+             , data = soilcamfd, method = "REML"
+             )
+summary(tocguild) 
+appraise(tocguild)
+draw(tocguild, residuals = T, parametric = T, scales="fixed")
+gam.check(tocguild)
+
+tocguild <- getViz(tocguild)
+smooth_terms <- list(
+  "s(grtr)"   = "#934607",
+  "s(grfr)"   = "darkolivegreen",
+  "s(brtr)"   = "#934607",
+  "s(brfr)"   = "darkolivegreen",
+  "s(mftr)"   = "#934607",
+  "s(mffr)"   = "darkolivegreen",
+  "s(dist_river)"   = "steelblue",  
+  "s(sand)"         = "steelblue",
+  "s(pbare)"        = "steelblue"
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(tocguild, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_ciPoly(fill = term_color, alpha = 0.4) + l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 12))
+}))
+as_flextable(tocguild) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(tocguild)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
+
+```{r GAM 3.4: SOCstock ~ Digestive + Activity, message=F, warning=F}
+tocdig <- gam(SOCstock ~ 
+               s(rumtr, k=4) + s(rumfr, k=4) 
+             + s(nrumtr, k=4) + s(nrumfr, k=4)
+             + s(sand) + s(pbare) + s(dist_river)
+            , data = soilcamfd, method = "REML"
+            )
+summary(tocdig) 
+appraise(tocdig)
+draw(tocdig, residuals = T, parametric = T, scales="fixed")
+gam.check(tocdig)
+
+tocdig <- getViz(tocdig)
+smooth_terms <- list(
+  "s(rumtr)"         = "#934607",
+  "s(rumfr)"         = "darkolivegreen",
+  "s(nrumtr)"        = "#934607",
+  "s(nrumfr)"        = "darkolivegreen",
+  "s(dist_river)"    = "steelblue",  
+  "s(sand)"          = "steelblue",  
+  "s(pbare)"         = "steelblue" 
+)
+(plots <- lapply(1:length(smooth_terms), function(i) {
+  term_name <- names(smooth_terms)[i]
+  term_color <- smooth_terms[[i]]
+plot(sm(tocdig, i)) +
+    l_fitLine(colour = "black", size = 1.2) +
+    l_ciPoly(fill = term_color, alpha = 0.4) + l_rug(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    theme(text = element_text(family = "EB Garamond", size = 12))
+}))
+as_flextable(tocdig) %>%
+  add_header_lines(values = paste("Model formula:", format(formula(tocdig)))) %>%
+  set_table_properties(width = .75, layout = "autofit")
+```
